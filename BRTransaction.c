@@ -39,8 +39,7 @@
 #define SIGHASH_NONE         0x02 // sign none of the outputs, I don't care where the bitcoins go
 #define SIGHASH_SINGLE       0x03 // sign one of the outputs, I don't care where the other outputs go
 #define SIGHASH_ANYONECANPAY 0x80 // let other people add inputs, I don't care where the rest of the bitcoins come from
-#define SIGHASH_FORKID       0x40 // use BIP143 digest method (for b-cash signatures)
-
+#define SIGHASH_FORKID       0x40 // use BIP143 digest method (for b-cash/b-gold signatures)
 
 // returns a random number less than upperBound, for non-cryptographic use only
 uint32_t BRRand(uint32_t upperBound)
@@ -246,6 +245,15 @@ static size_t _BRTransactionWitnessData(const BRTransaction *tx, uint8_t *data, 
     off += sizeof(UInt256);
     if (data && off + sizeof(uint32_t) <= dataLen) UInt32SetLE(&data[off], tx->lockTime); // locktime
     off += sizeof(uint32_t);
+    // support for transaction messages
+    // serialize tx_comment only for whole transaction !
+    if (index == SIZE_MAX && tx->version == TX_VERSION_MSG) {
+        off += BRVarIntSet((data ? &data[off] : NULL), (off <= dataLen ? dataLen - off : 0), tx->commentLength);
+        if ((tx->comment != NULL) &&  (off + tx->commentLength) <= dataLen) {
+            memcpy(&data[off], tx->comment, tx->commentLength);
+        }
+        off += tx->commentLength;
+    }
     if (data && off + sizeof(uint32_t) <= dataLen) UInt32SetLE(&data[off], hashType); // hash type
     off += sizeof(uint32_t);
     return (! data || off <= dataLen) ? off : 0;
@@ -315,7 +323,6 @@ static size_t _BRTransactionData(const BRTransaction *tx, uint8_t *data, size_t 
     if (data && off + sizeof(uint32_t) <= dataLen) UInt32SetLE(&data[off], tx->lockTime); // locktime
     off += sizeof(uint32_t);
 
-       
     // support for transaction messages
     // serialize tx_comment only for whole transaction !
     if (index == SIZE_MAX && tx->version == TX_VERSION_MSG) {
@@ -348,6 +355,32 @@ BRTransaction *BRTransactionNew(void)
     tx->commentLength = 0;
     tx->comment = NULL;
     return tx;
+}
+
+// returns a deep copy of tx and that must be freed by calling BRTransactionFree()
+BRTransaction *BRTransactionCopy(const BRTransaction *tx)
+{
+    BRTransaction *cpy = BRTransactionNew();
+    BRTxInput *inputs = cpy->inputs;
+    BRTxOutput *outputs = cpy->outputs;
+    
+    assert(tx != NULL);
+    *cpy = *tx;
+    cpy->inputs = inputs;
+    cpy->outputs = outputs;
+    cpy->inCount = cpy->outCount = 0;
+
+    for (size_t i = 0; i < tx->inCount; i++) {
+        BRTransactionAddInput(cpy, tx->inputs[i].txHash, tx->inputs[i].index, tx->inputs[i].amount,
+                              tx->inputs[i].script, tx->inputs[i].scriptLen,
+                              tx->inputs[i].signature, tx->inputs[i].sigLen, tx->inputs[i].sequence);
+    }
+    
+    for (size_t i = 0; i < tx->outCount; i++) {
+        BRTransactionAddOutput(cpy, tx->outputs[i].amount, tx->outputs[i].script, tx->outputs[i].scriptLen);
+    }
+
+    return cpy;
 }
 
 // buf must contain a serialized tx
@@ -412,12 +445,12 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
     if (tx->version == TX_VERSION_MSG) {
         tx->commentLength = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
         off += len;
-	if ((tx->commentLength > 0) && ((off + tx->commentLength) <= bufLen)) {
-    	    tx->comment = malloc(tx->commentLength);
-    	    memcpy(tx->comment, &buf[off], tx->commentLength);
-    	    off += tx->commentLength;
-	} else {
-	    tx->comment = NULL;
+        if ((tx->commentLength > 0) && ((off + tx->commentLength) <= bufLen)) {
+            tx->comment = malloc(tx->commentLength);
+            memcpy(tx->comment, &buf[off], tx->commentLength);
+            off += tx->commentLength;
+        } else {
+            tx->comment = NULL;
             tx->commentLength = 0;
         }
     }
@@ -514,7 +547,7 @@ size_t BRTransactionSize(const BRTransaction *tx)
     }
 
     if (tx->version == TX_VERSION_MSG) {
-	size += BRVarIntSize(tx->commentLength) + tx->commentLength;
+        size += BRVarIntSize(tx->commentLength) + tx->commentLength;
     }
     
     return size;
@@ -540,7 +573,7 @@ int BRTransactionIsSigned(const BRTransaction *tx)
 }
 
 // adds signatures to any inputs with NULL signatures that can be signed with any keys
-// forkId is 0 for bitcoin, 0x40 for b-cash
+// forkId is 0 for bitcoin, 0x40 for b-cash, 0x4f for b-gold
 // returns true if tx is signed
 int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCount)
 {
@@ -632,7 +665,7 @@ void BRTransactionFree(BRTransaction *tx)
         array_free(tx->inputs);
 
         if (tx->comment != NULL)
-	    free(tx->comment);
+            free(tx->comment);
 
         free(tx);
     }
@@ -642,18 +675,18 @@ void BRTransactionFree(BRTransaction *tx)
 void BRTransactionSetMessage(BRTransaction * tx, char * comment, size_t comLen) {
     if (tx != NULL) {
         if (tx->comment != NULL) {
-	    free(tx->comment);
-	}
+            free(tx->comment);
+        }
         tx->comment = NULL;
-	tx->commentLength = 0;
-	tx->version = TX_VERSION;
+        tx->commentLength = 0;
+        tx->version = TX_VERSION;
         if ( (comLen > 0) && (comment != NULL) ) {
-	    tx->comment = malloc(comLen);
-    	    if (tx->comment != NULL) {
-		memcpy(tx->comment, comment, comLen);
-		tx->commentLength = comLen;
-		tx->version = TX_VERSION_MSG;
-	    }
-	}
+            tx->comment = malloc(comLen);
+            if (tx->comment != NULL) {
+                memcpy(tx->comment, comment, comLen);
+                tx->commentLength = comLen;
+                tx->version = TX_VERSION_MSG;
+            }
+        }
     }
 }

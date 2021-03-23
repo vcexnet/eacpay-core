@@ -23,6 +23,7 @@
 //  THE SOFTWARE.
 
 #include "BRMerkleBlock.h"
+#include "BRTransaction.h"
 #include "BRCrypto.h"
 #include "BRAddress.h"
 #include <stdlib.h>
@@ -32,7 +33,9 @@
 #include <assert.h>
 
 #define MAX_PROOF_OF_WORK 0x1e0fffff    // highest value for difficulty target (higher values are less difficult)
-#define TARGET_TIMESPAN   1800        // the targeted timespan between difficulty target adjustments (3.5*24*60*60)
+#define TARGET_TIMESPAN   1800          // = 3.5*24*60*60; the targeted timespan between difficulty target adjustments
+
+#define VERSION_AUXPOW    0x00000100
 
 inline static int _ceil_log2(int x)
 {
@@ -41,6 +44,58 @@ inline static int _ceil_log2(int x)
     while ((x >>= 1) != 0) r++;
     return r;
 }
+
+// return true if block is AUX-POW based on block version
+int isAuxpow(uint32_t version)
+{
+    return version & VERSION_AUXPOW;
+}
+
+// return size of AUX-POW data to be deserialized
+size_t calcAuxpowSize(const uint8_t *buf, size_t off)
+{
+    int isWitness = 0;
+    size_t len, in_cnt, out_cnt, wit_cnt, cnt;
+    size_t initialOffset = off;
+    off += 4;       // tx_version
+    if (buf[off] == 0x00 && buf[off+1] == 0x01) {
+        off += 2;   // witness flag
+        isWitness = 1;
+    }
+    in_cnt = (size_t)BRVarInt(&buf[off], 9, &len);
+    off += len;
+    for (size_t i=0; i<in_cnt; i++) {
+        off += 36;              // previous_output
+        cnt = (size_t)BRVarInt(&buf[off], 9, &len);
+        off += len + cnt + 4;   // sig script + sequence
+    }
+    out_cnt = (size_t)BRVarInt(&buf[off], 9, &len);
+    off += len;
+    for (size_t i=0; i<out_cnt; i++) {
+        off += 8;               // value
+        cnt = (size_t)BRVarInt(&buf[off], 9, &len);
+        off += len + cnt;       // pk_script
+    }
+    if (isWitness) {
+        for (size_t i=0; i<in_cnt; i++) {
+            wit_cnt = (size_t)BRVarInt(&buf[off], 9, &len);
+            off += len;
+            while(wit_cnt--) {
+                cnt = (size_t)BRVarInt(&buf[off], 9, &len);
+                off += len + cnt;       // witness
+            }
+        }
+    }
+    off += 4;       // lock time
+    off += 32;      // hashBlock
+    cnt = (size_t)BRVarInt(&buf[off], 9, &len);
+    off += len + 32*cnt + 4;  // coinbase branch + bitmask
+    cnt = (size_t)BRVarInt(&buf[off], 9, &len);
+    off += len + 32*cnt + 4;  // blockchain branch + bitmask
+    off += 80;  // parent block header
+    return off-initialOffset;
+}
+
 
 // from https://en.bitcoin.it/wiki/Protocol_specification#Merkle_Trees
 // Merkle trees are binary trees of hashes. Merkle trees in bitcoin use a double SHA-256, the SHA-256 hash of the
@@ -80,7 +135,30 @@ BRMerkleBlock *BRMerkleBlockNew(void)
     assert(block != NULL);
     
     block->height = BLOCK_UNKNOWN_HEIGHT;
+    block->auxpowData = NULL;
+    block->auxpowLen = 0;
     return block;
+}
+
+// returns a deep copy of block and that must be freed by calling BRMerkleBlockFree()
+BRMerkleBlock *BRMerkleBlockCopy(const BRMerkleBlock *block)
+{
+    BRMerkleBlock *cpy = BRMerkleBlockNew();
+
+    assert(block != NULL);
+    *cpy = *block;
+    cpy->hashes = NULL;
+    cpy->flags = NULL;
+    BRMerkleBlockSetTxHashes(cpy, block->hashes, block->hashesCount, block->flags, block->flagsLen);
+    // deep copy of AUX-POW data
+    cpy->auxpowData = NULL;
+    cpy->auxpowLen = block->auxpowLen;
+    if (block->auxpowData)
+    {
+        cpy->auxpowData = malloc(block->auxpowLen);
+        memcpy(cpy->auxpowData, block->auxpowData, block->auxpowLen);
+    }
+    return cpy;
 }
 
 // buf must contain either a serialized merkleblock or header
@@ -105,7 +183,18 @@ BRMerkleBlock *BRMerkleBlockParse(const uint8_t *buf, size_t bufLen)
         off += sizeof(uint32_t);
         block->nonce = UInt32GetLE(&buf[off]);
         off += sizeof(uint32_t);
-        
+
+        // here read AUX-POW from buffer
+        if (isAuxpow(block->version))
+        {
+            block->auxpowLen = calcAuxpowSize(buf, off);
+            block->auxpowData = malloc(block->auxpowLen);
+            memcpy(block->auxpowData, &buf[off], block->auxpowLen);
+            off += block->auxpowLen;
+            if (bufLen == 81)
+                bufLen += block->auxpowLen;
+        }
+
         if (off + sizeof(uint32_t) <= bufLen) {
             block->totalTx = UInt32GetLE(&buf[off]);
             off += sizeof(uint32_t);
@@ -140,6 +229,9 @@ size_t BRMerkleBlockSerialize(const BRMerkleBlock *block, uint8_t *buf, size_t b
         len += sizeof(uint32_t) + BRVarIntSize(block->hashesCount) + block->hashesCount*sizeof(UInt256) +
                BRVarIntSize(block->flagsLen) + block->flagsLen;
     }
+
+    if (block->auxpowData)
+        len += block->auxpowLen;
     
     if (buf && len <= bufLen) {
         UInt32SetLE(&buf[off], block->version);
@@ -154,7 +246,15 @@ size_t BRMerkleBlockSerialize(const BRMerkleBlock *block, uint8_t *buf, size_t b
         off += sizeof(uint32_t);
         UInt32SetLE(&buf[off], block->nonce);
         off += sizeof(uint32_t);
-    
+
+        // here write AUX-POW to the buffer
+        if (block->auxpowData && isAuxpow(block->version))
+        {
+            if (buf && off+block->auxpowLen <= bufLen)
+                memcpy(&buf[off], block->auxpowData, block->auxpowLen);
+            off += block->auxpowLen;
+        }
+
         if (block->totalTx > 0) {
             UInt32SetLE(&buf[off], block->totalTx);
             off += sizeof(uint32_t);
@@ -277,11 +377,13 @@ int BRMerkleBlockIsValid(const BRMerkleBlock *block, uint32_t currentTime)
     
     if (size > 3) UInt32SetLE(&t.u8[size - 3], target);
     else UInt32SetLE(t.u8, target >> (3 - size)*8);
-    
-    for (int i = sizeof(t) - 1; r && i >= 0; i--) { // check proof-of-work
-        if (block->powHash.u8[i] < t.u8[i]) break;
-        if (block->powHash.u8[i] > t.u8[i]) r = 0;
-    }
+
+    // todo - check auxpow validity, now it is always passed
+    if (!block->auxpowData)
+        for (int i = sizeof(t) - 1; r && i >= 0; i--) { // check proof-of-work
+            if (block->powHash.u8[i] < t.u8[i]) break;
+            if (block->powHash.u8[i] > t.u8[i]) r = 0;
+        }
     
     return r;
 }
@@ -321,20 +423,14 @@ int BRMerkleBlockVerifyDifficulty(const BRMerkleBlock *block, const BRMerkleBloc
     
     if (! previous || !UInt256Eq(block->prevBlock, previous->blockHash) || block->height != previous->height + 1) r = 0;
     if (r && (block->height % BLOCK_DIFFICULTY_INTERVAL) == 0 && transitionTime == 0) r = 0;
-    
-#if LITECOIN_TESTNET
-    // TODO: implement testnet difficulty rule check
-    return r; // don't worry about difficulty on testnet for now
-#endif
-
-    // TODO: fix difficulty target check for Litecoin
+        
     // if (r && (block->height % BLOCK_DIFFICULTY_INTERVAL) == 0) {
     //     // target is in "compact" format, where the most significant byte is the size of resulting value in bytes, next
     //     // bit is the sign, and the remaining 23bits is the value after having been right shifted by (size - 3)*8 bits
     //     static const uint32_t maxsize = MAX_PROOF_OF_WORK >> 24, maxtarget = MAX_PROOF_OF_WORK & 0x00ffffff;
     //     int timespan = (int)((int64_t)previous->timestamp - (int64_t)transitionTime), size = previous->target >> 24;
     //     uint64_t target = previous->target & 0x00ffffff;
-
+    
     //     // limit difficulty transition to -75% or +400%
     //     if (timespan < TARGET_TIMESPAN/4) timespan = TARGET_TIMESPAN/4;
     //     if (timespan > TARGET_TIMESPAN*4) timespan = TARGET_TIMESPAN*4;
@@ -364,5 +460,6 @@ void BRMerkleBlockFree(BRMerkleBlock *block)
     
     if (block->hashes) free(block->hashes);
     if (block->flags) free(block->flags);
+    if (block->auxpowData) free(block->auxpowData);
     free(block);
 }

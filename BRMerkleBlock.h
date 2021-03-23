@@ -52,13 +52,21 @@ typedef struct {
     uint8_t *flags;
     size_t flagsLen;
     uint32_t height;
+    uint8_t *auxpowData;
+    size_t auxpowLen;
 } BRMerkleBlock;
 
 #define BR_MERKLE_BLOCK_NONE\
     ((BRMerkleBlock) { UINT256_ZERO, 0, UINT256_ZERO, UINT256_ZERO, 0, 0, 0, 0, NULL, 0, NULL, 0, 0 })
 
+// return size of AUX-POW data to be deserialized
+size_t calcAuxpowSize(const uint8_t *buf, size_t off);
+
 // returns a newly allocated merkle block struct that must be freed by calling BRMerkleBlockFree()
 BRMerkleBlock *BRMerkleBlockNew(void);
+
+// returns a deep copy of block and that must be freed by calling BRMerkleBlockFree()
+BRMerkleBlock *BRMerkleBlockCopy(const BRMerkleBlock *block);
 
 // buf must contain either a serialized merkleblock or header
 // returns a merkle block struct that must be freed by calling BRMerkleBlockFree()
@@ -97,9 +105,13 @@ inline static size_t BRMerkleBlockHash(const void *block)
 // true if block and otherBlock have equal blockHash values
 inline static int BRMerkleBlockEq(const void *block, const void *otherBlock)
 {
+    if (!block || !otherBlock)
+        return 0;
     return (block == otherBlock ||
             UInt256Eq(((const BRMerkleBlock *)block)->blockHash, ((const BRMerkleBlock *)otherBlock)->blockHash));
 }
+
+// true
 
 // frees memory allocated for block
 void BRMerkleBlockFree(BRMerkleBlock *block);
